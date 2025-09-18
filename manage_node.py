@@ -3,11 +3,20 @@ import codecs
 import json
 import base64
 from requests.exceptions import RequestException
+import os
+from dotenv import load_dotenv
 
-LND_REST = "https://127.0.0.1:8081"
-TLS_CERT_PATH = "/Users/safwanonakkal/.polar/networks/5/volumes/lnd/alice/tls.cert"
-MACAROON_PATH = "/Users/safwanonakkal/.polar/networks/5/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
-BACKUP_FILE = 'channel_backup.json'
+load_dotenv()
+
+LND_REST = os.getenv("LND_REST")
+TLS_CERT_PATH = os.getenv("TLS_CERT_PATH")
+MACAROON_PATH = os.getenv("MACAROON_PATH")
+BACKUP_FILE = os.getenv("BACKUP_FILE")
+
+# LND_REST = "https://127.0.0.1:8081"
+# TLS_CERT_PATH = "/Users/safwanonakkal/.polar/networks/5/volumes/lnd/alice/tls.cert"
+# MACAROON_PATH = "/Users/safwanonakkal/.polar/networks/5/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
+# BACKUP_FILE = 'channel_backup.json'
 
 with open(MACAROON_PATH, "rb") as f:
     macaroon = codecs.encode(f.read(), 'hex').decode()
@@ -138,7 +147,6 @@ def list_channels():
     """
     try:
         r = requests.get(f"{LND_REST}/v1/channels", headers=HEADERS, verify=CERT)
-        print("Current channels:", r.json())
         return r.json().get("channels", [])
     except Exception as e:
         print(f"Error listing channels: {e}")
@@ -339,10 +347,236 @@ def get_nodeinfo():
     except Exception as e:
         print(f"Error fetching node info: {e}")
 
+def get_closed_channels():
+    """
+    Fetch closed channels from the LND node.
+
+    This function fetches information about closed channels from the LND node and prints it to the console.
+    The function takes no arguments and returns a JSON object containing the closed channel information.
+
+    Returns:
+        dict: The closed channel information as a JSON object.
+
+    Raises:
+        Exception: If there is an error fetching the closed channels.
+    """
+    try:
+        r = requests.get(f"{LND_REST}/v1/channels/closed", headers=HEADERS, verify=CERT)
+        print("Closed Channels:", json.dumps(r.json(), indent=2))
+        return r.json()
+    except Exception as e:
+        print(f"Error fetching closed channels: {e}")
+
+
+def get_routes(pubkey, amt):
+    """
+    Fetch a list of routes from the LND node that can be used to send a payment to the given pubkey with the given amount.
+
+    Args:
+        pubkey (str): The pubkey of the node to send the payment to.
+        amt (int): The amount of the payment in satoshis.
+
+    Returns:
+        list: A list of routes that can be used to send the payment.
+
+    Raises:
+        Exception: If there is an error fetching the routes.
+    """
+    try:
+        r = requests.get(f"{LND_REST}/v1/graph/routes/{pubkey}/{amt}", headers=HEADERS, verify=CERT)
+        print("Routes:", json.dumps(r.json(), indent=2))
+        return r.json()
+    except Exception as e:
+        print(f"Error fetching routes: {e}")
+
+def get_fee_report():
+    """
+    Fetch a fee report from the LND node.
+
+    The fee report contains information about the current fee rates of the node.
+
+    Returns:
+        dict: The fee report as a JSON object.
+
+    Raises:
+        Exception: If there is an error fetching the fee report.
+    """
+    try:
+        r = requests.get(f"{LND_REST}/v1/fees", headers=HEADERS, verify=CERT)
+        print("Fee Report:", json.dumps(r.json(), indent=2))
+        return r.json()
+    except Exception as e:
+        print(f"Error fetching fee report: {e}")
+
+def change_fee(selected_peer, selected_channel, base_fee):
+    """
+    Change the fee rate for a given channel with the given peer and base fee.
+
+    Args:
+        selected_peer (dict): The peer to change the fee rate for.
+        selected_channel (dict): The channel to change the fee rate for.
+        base_fee (int): The new base fee rate in msat.
+
+    Returns:
+        dict: The response from the LND node containing the updated fee rate.
+
+    Raises:
+        Exception: If there is an error changing the fee rate.
+    """
+    try:
+        channel_point = selected_channel["channel_point"].split(":")
+        txid = channel_point[0]
+        output_index = channel_point[1]
+        data={
+            'chan_point': {
+                            'funding_txid_str': txid,
+                            'output_index': output_index
+                        },
+            'base_fee_msat': base_fee,
+            'time_lock_delta': 144
+        }
+        r = requests.post(f"{LND_REST}/v1/chanpolicy", json=data, headers=HEADERS, verify=CERT)
+        print("Fee rate changed:", r.json())
+    except Exception as e:
+        print(f"Error changing fee rate: {e}")
+
+def list_towers():
+    try:
+        r = requests.get(f"{LND_REST}/v2/watchtower/client", headers=HEADERS, verify=CERT)
+        print("Towers:", json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print(f"Error listing towers: {e}")
+
+def add_towers(pubkey):
+    """
+    Add a new tower to the node.
+
+    Args:
+        pubkey (str): The pubkey of the tower to add.
+
+    Returns:
+        dict: The response from the LND node containing the updated tower info.
+
+    Raises:
+        Exception: If there is an error adding the tower.
+    """
+    try:
+        pubkey_bytes = bytes.fromhex(pubkey)
+        data = {
+        'pubkey': base64.b64encode(pubkey_bytes).decode('utf-8'),
+        'address': 'tower:9911',
+        }
+        r = requests.post(f"{LND_REST}/v2/watchtower/client", json=data, headers=HEADERS, verify=CERT)
+        print("Tower added:", r.json())
+    except Exception as e:
+        print(f"Error adding tower: {e}")
+
+def get_tower_stats():
+    """
+    Fetch the current stats of the tower.
+
+    This function fetches information about the current stats of the tower and prints it to the console.
+    The function takes no arguments and returns a JSON object containing the tower stats.
+
+    Returns:
+        dict: The tower stats as a JSON object.
+
+    Raises:
+        Exception: If there is an error fetching the tower stats.
+    """
+    try:
+        r = requests.get(f"{LND_REST}/v2/watchtower/client/stats", headers=HEADERS, verify=CERT)
+        print("Tower stats:", json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print(f"Error getting tower info: {e}")
+
+def deactivate_tower(pubkey):
+    """
+    Deactivate a tower with the given pubkey.
+
+    Args:
+        pubkey (str): The pubkey of the tower to deactivate.
+
+    Returns:
+        dict: The response from the LND node containing the updated tower info.
+
+    Raises:
+        Exception: If there is an error deactivating the tower.
+    """
+    try:
+        pubkey_bytes = bytes.fromhex(pubkey)
+        pubkey_b64 = base64.b64encode(pubkey_bytes).decode('utf-8')
+        pubkey_urlsafe = pubkey_b64.replace('+', '-').replace('/', '_')
+        pubkey_urlsafe = pubkey_urlsafe.rstrip('=')
+        data = {
+            'pubkey': pubkey_urlsafe,
+        }
+        r = requests.post(f"{LND_REST}/v2/watchtower/client/tower/deactivate/{pubkey_urlsafe}", json=data, headers=HEADERS, verify=CERT)
+        print("Tower deactivated:", json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print(f"Error deactivating tower: {e}")
+
+def remove_tower(pubkey):
+    """
+    Remove a tower with the given pubkey.
+
+    Args:
+        pubkey (str): The pubkey of the tower to remove.
+
+    Returns:
+        dict: The response from the LND node containing the updated tower info.
+
+    Raises:
+        Exception: If there is an error removing the tower.
+    """
+    try:
+        pubkey_bytes = bytes.fromhex(pubkey)
+        pubkey_b64 = base64.b64encode(pubkey_bytes).decode('utf-8')
+        pubkey_urlsafe = pubkey_b64.replace('+', '-').replace('/', '_')
+        pubkey_urlsafe = pubkey_urlsafe.rstrip('=')
+
+        r = requests.delete(f"{LND_REST}/v2/watchtower/client/{pubkey_urlsafe}", headers=HEADERS, verify=CERT)
+        print("Tower removed:", r.json())
+    except Exception as e:
+        print(f"Error removing tower: {e}")
+
+def get_tower_info():
+    """
+    Fetch information about the current tower.
+
+    This function fetches information about the current tower and prints it to the console.
+    The function takes no arguments and returns a JSON object containing the tower info.
+
+    Returns:
+        dict: The tower info as a JSON object.
+
+    Raises:
+        Exception: If there is an error fetching the tower info.
+    """
+    try:
+        r = requests.get(f"{LND_REST}/v2/watchtower/server", headers=HEADERS, verify=CERT)
+        print("Tower info:", json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print(f"Error getting tower info: {e}")
+
+
+def list_payments():
+    try:
+        r = requests.get(f"{LND_REST}/v1/payments", headers=HEADERS, verify=CERT)
+        print("Payments:", json.dumps(r.json(), indent=2))
+    except Exception as e:
+        print(f"Error listing payments: {e}")
 
 if __name__ == "__main__":
     try:
-        print("1. Open channel\n2. Balance\n3. Invoice\n4. Close Channel\n5. List Peers\n6. List Channels\n7. Wallet Balance\n8. Node Backup\n9. Restore Node from Backup\n10. Custom Message\n11. Node Info")
+        print("1. Open channel\n2. Balance\n3. Invoice\n4. Close Channel\n5. List Peers\n6. List Channels\n7. Wallet Balance\n8. Node Backup\n9. Restore Node from Backup\n10. Custom Message\n11. Node Info\n12. Closed Channels" \
+        "\n13. Routes"
+        "\n14. Fee Report"
+        "\n15. Change Fee"
+        "\n16. Towers"
+        "\n17. List Payments"
+        
+        )
         choice = input("Enter your choice: ")
 
         if choice == "1":
@@ -370,7 +604,8 @@ if __name__ == "__main__":
         elif choice == "5":
             list_peers()
         elif choice == "6":
-            list_channels()
+            active_channels=list_channels()
+            print("Active Channels:", json.dumps(active_channels, indent=2))
         elif choice == "7":
             get_balance()
         elif choice == "8":
@@ -383,5 +618,41 @@ if __name__ == "__main__":
                 custom_message(selected_channel, selected_peer)
         elif choice == "11":
             get_nodeinfo()
+        elif choice == "12":
+            get_closed_channels()
+        elif choice == "13":
+            pubkey = input("Enter the public key of the node you want to connect to: ")
+            amt = input("Enter the amount in sats: ")
+            get_routes(pubkey, amt)
+        elif choice == "14":
+            get_fee_report()
+        elif choice == "15":
+            base_fee = input("Enter the base fee in sats: ")
+            selected_peer, selected_channel = channel_flow()
+            change_fee(selected_peer, selected_channel, base_fee)
+        elif choice == "16":
+            print("\n1. List Towers\n2. Add Tower\n3. Get Tower Stats\n4. Tower Deactivate\n5. Remove Tower\n6. Get Tower Info")
+            choice = input("Enter your choice: ")
+            if choice == "1":
+                list_towers()
+            elif choice == "2":
+                pubkey = input("Enter the public key of the tower you want to add: ")
+                add_towers(pubkey)
+            elif choice == "3":
+                get_tower_stats()
+            elif choice =="4":
+                pubkey = input("Enter the public key of the tower you want to deactivate: ")
+                deactivate_tower(pubkey)
+            elif choice == "5":
+                pubkey = input("Enter the public key of the tower you want to remove: ")
+                remove_tower(pubkey)
+            elif choice == "6":
+                get_tower_info()
+        elif choice == "17":
+            list_payments()
+
+        else:
+            print("Invalid choice.")
+        
     except Exception as e:
         print(f"Unexpected error: {e}")
