@@ -190,15 +190,6 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
     )}
 
 
-# ------------------------------
-# GLOBAL PAYMENT REGISTRY
-# ------------------------------
-PAYMENT_REGISTRY = {}
-# payment_hash -> {
-#   "receiver": pubkey,
-#   "payer": pubkey
-# }
-
 def normalize_hash(h: str) -> str:
     """Ensure payment hash is in hex format. Converts from Base64 if needed."""
     if not h:
@@ -401,8 +392,6 @@ class NWCBridge:
                         raw_event = event.get("raw", {})
                         # HTLC events have a payment_hash
                         payment_hash = normalize_hash(raw_event.get("payment_hash", ""))
-                        # priv_key = PrivateKey.from_hex(self.client_pk)
-                        # pub_key_hex = priv_key.public_key.format(compressed=True)[1:].hex()
 
                         # Map to NIP-47 transaction object
                         tx_data = {
@@ -442,10 +431,6 @@ class NWCBridge:
                 status = payment.get("status")
                 if status == "SUCCEEDED":
                     payment_hash = normalize_hash(payment.get("payment_hash", ""))
-
-                    # if payment_hash in PAYMENT_REGISTRY:
-                        # entry = PAYMENT_REGISTRY[payment_hash]
-                        # payer = entry.get("payer")
                     payer=self.client_pk
                     if payer:
                         # Map to NIP-47 transaction object
@@ -646,14 +631,6 @@ class NWCBridge:
         if payment_error:
             return None, {"code": "PAYMENT_FAILED", "message": payment_error}
 
-        # # ✅ STORE PAYER
-        # if payment_hash:
-        #     payment_hash = normalize_hash(payment_hash)
-        #     if payment_hash not in PAYMENT_REGISTRY:
-        #         PAYMENT_REGISTRY[payment_hash] = {"receiver": None}
-
-        #     PAYMENT_REGISTRY[payment_hash]["payer"] = client_pubkey
-        #     print(f"[{self.name}] PAYMENT REGISTRY PAYER ADDED | hash={payment_hash[:8]}...")
 
         fee_msat = int(res.get("fee_msat", 0) or 0)
 
@@ -711,10 +688,6 @@ class NWCBridge:
         fee_sat = int(res.get("fee_sat", 0) or 0)
         fee_msat = int(res.get("fee_msat", fee_sat * 1000) or fee_sat * 1000)
         
-        # PAYMENT_REGISTRY[payment_hash] = {
-        #     "receiver": "2dc454a845130af841fe1a851f14c255d7d30be35f7a2f4fa79fbf51ac6dcfc7",
-        #     "payer": None
-        # }
 
         result = {
             "preimage": res.get("payment_preimage", ""),
@@ -889,11 +862,6 @@ class NWCBridge:
         # Use the payment_hash from request params as LND hodl response doesn't return it
         payment_hash_val = normalize_hash(payment_hash)
 
-        # # ✅ STORE RECEIVER
-        # PAYMENT_REGISTRY[payment_hash_val] = {
-        #     "receiver": client_pubkey,
-        #     "payer": None
-        # }
         print(f"[{self.name}] PAYMENT REGISTRY RECEIVER ADDED (HOLD) | hash={payment_hash_val[:8]}...")
         
         now = int(time.time())
@@ -1039,11 +1007,6 @@ class NWCBridge:
                     if method in ("pay_invoice", "pay_keysend"):
                         payment_hash = result.get("payment_hash")
 
-                        # if payment_hash:
-                        #     payment_hash = normalize_hash(payment_hash)
-                        #     if payment_hash in PAYMENT_REGISTRY:
-                        #         entry = PAYMENT_REGISTRY[payment_hash]
-                        #         payer = entry.get("payer")
                         payer=self.client_pk
 
                         if payer:
@@ -1086,7 +1049,6 @@ class NWCBridge:
             asyncio.create_task(self._listen_for_invoices())
             # asyncio.create_task(self._listen_for_payments())
             # asyncio.create_task(self._listen_for_htlc_events())
-
             # Subscribe to NWC requests (Kind 23194) addressed to our pubkey
             req_filter = Filter(kinds=[23194], p=[self.public_key])
             sub_id = await self.client.subscribe(req_filter)

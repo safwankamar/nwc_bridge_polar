@@ -50,67 +50,7 @@ class LNDNode:
             return r.json()
         except Exception as e:
             logger.error(f"Error creating invoice: {e}")
-            return {"error": str(e)}
-
-    # def settle_invoice(self, payment_request):
-    #     try:
-    #         data = {"payment_request": payment_request}
-    #         r = requests.post(f"{self.rest_url}/v1/channels/transactions", headers=self.headers, json=data, verify=self.cert)
-    #         r.raise_for_status()
-    #         return r.json()
-    #     except Exception as e:
-    #         logger.error(f"Error settling invoice: {e}")
-    #         return {"error": str(e)}
-
-    # async def settle_invoice_v2(self,payment_request: str):
-        # """
-        # Pay a BOLT11 invoice using LND's SendPaymentV2 streaming API.
-        # POST /v2/router/send
-        # """
-        # try:
-        #     data = {
-        #         "payment_request": payment_request,
-        #         "fee_limit_sat": "10",
-        #         "timeout_seconds": 60
-        #     }
-
-        #     r = requests.post(
-        #         f"{self.rest_url}/v2/router/send",
-        #         headers=self.headers,
-        #         json=data,
-        #         verify=self.cert,
-        #         stream=True                         # Required: endpoint streams status updates
-        #     )
-        #     r.raise_for_status()
-        #     for raw_line in r.iter_lines():
-        #                 if not raw_line:
-        #                     continue
-
-        #                 update = json.loads(raw_line)
-        #                 result = update.get("result", update)   # REST wraps response in {"result": {...}}
-        #                 status = result.get("status", "UNKNOWN")
-
-        #                 print(f"  ↳ Status: {status}")
-
-        #                 if status == "SUCCEEDED":
-        #                     return {"success": True, "result": result}
-
-        #                 elif status == "FAILED":
-        #                     reason = result.get("failure_reason", "UNKNOWN_REASON")
-        #                     return {"success": False, "error": f"Payment failed: {reason}", "result": result}
-
-        #     return {"success": False, "error": "Stream ended without a final status."}
-
-        # except requests.exceptions.HTTPError as e:
-        #     try:
-        #         error_body = e.response.json()
-        #     except Exception:
-        #         error_body = e.response.text
-        #         return {"success": False, "error": error_body}
-
-        # except Exception as e:
-        #     return {"success": False, "error": str(e)}           
-  
+            return {"error": str(e)}  
     
     async def settle_invoice_v2(self, payment_request: str):
         """
