@@ -153,6 +153,7 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
     Used by make_invoice, lookup_invoice, list_transactions.
     """
     # Determine settled state
+    # settled = tx.get("settled", False)
     settled = tx.get("settled", False)
     state = "settled" if settled else "pending"
 
@@ -161,7 +162,7 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
     amount_sat = int(tx.get("value") or tx.get("amt") or tx.get("amount") or tx.get("value_sat") or tx.get("num_satoshis") or 0)
     fees_sat = int(tx.get("fee_sat") or tx.get("fee") or 0)
 
-    created_at = int(tx.get("creation_date") or tx.get("creation_time_ns", 0) or 0)
+    created_at = int(tx.get("creation_date") or tx.get("creation_time_ns") or tx.get("timestamp") or 0)
     # creation_time_ns is nanoseconds; convert if needed
     if created_at > 1e12:
         created_at = created_at // 1_000_000_000
@@ -173,6 +174,7 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
     result = {
         "type": tx_type,
         "state": state,
+        "status": tx.get("status"),
         "invoice": tx.get("payment_request") or tx.get("invoice"),
         "description": tx.get("memo") or tx.get("description"),
         "description_hash": tx.get("description_hash"),
@@ -334,6 +336,17 @@ class NWCBridge:
         """Dedicated helper for hold_invoice_accepted."""
         await self.send_notification(client_pubkey, "hold_invoice_accepted", tx_data)
 
+    async def send_payment_failed_notification(self, client_pubkey: str, tx_data: dict):
+        """Dedicated helper for payment_failed (cancelled)."""
+        await self.send_notification(client_pubkey, "payment_failed", tx_data)
+
+    async def send_invoice_expired_notification(self, client_pubkey: str, tx_data: dict):
+        """Dedicated helper for invoice_expired."""
+        await self.send_notification(client_pubkey, "invoice_expired", tx_data)
+
+    async def send_payment_in_transition_notification(self, client_pubkey: str, message: str):
+        """Dedicated helper for information."""
+        await self.send_notification(client_pubkey, "information", {"message": message})
     async def _listen_for_invoices(self):
         """Background task to listen for invoice settlements from our LND node."""
         print(f"[{self.name}] Started invoice listener.")
@@ -345,10 +358,6 @@ class NWCBridge:
                     state = invoice.get("state")
                     if state in ("SETTLED", "ACCEPTED") or invoice.get("settled"):
                         payment_hash = normalize_hash(invoice.get("r_hash") or invoice.get("payment_hash", ""))
-                        
-                        # if payment_hash in PAYMENT_REGISTRY:
-                        #     entry = PAYMENT_REGISTRY[payment_hash]
-                            # receiver = entry.get("receiver")
                         receiver = self.client_pk
                             
                         if receiver:
@@ -368,12 +377,6 @@ class NWCBridge:
                                     self.loop
                                 )
                                 print(f"[{self.name}] Hold invoice accepted | notifying {receiver[:8]}... (hash={payment_hash[:8]})")
-                        # elif state == "SETTLED" and invoice.get("is_keysend")==True:
-                        #     asyncio.run_coroutine_threadsafe(
-                        #         self.send_payment_received_notification(receiver, tx_data),
-                        #         self.loop
-                        #     )
-                        #     print(f"[{self.name}] Keysend detected | notifying {receiver[:8]}... (hash={payment_hash[:8]})")
                             
             except Exception as e:
                 logger.error(f"[{self.name}] Invoice listener thread error: {e}")
@@ -407,16 +410,6 @@ class NWCBridge:
                             self.send_payment_received_notification(self.client_pk, tx_data),
                             self.loop
                         )
-
-                        # Check if we have a receiver in the registry
-                        # if payment_hash in PAYMENT_REGISTRY:
-                        #     receiver = PAYMENT_REGISTRY[payment_hash].get("receiver")
-                        #     if receiver:
-                        #         asyncio.run_coroutine_threadsafe(
-                        #             self.send_payment_received_notification(receiver, tx_data),
-                        #             self.loop
-                        #         )
-                        #         print(f"[{self.name}] Keysend detected | notifying {receiver[:8]}... (hash={payment_hash[:8]})")
             except Exception as e:
                 logger.error(f"[{self.name}] HTLC event listener thread error: {e}")
 
@@ -464,7 +457,9 @@ class NWCBridge:
                     break
                 elif status == "FAILED":
                     reason = result.get("failure_reason", "UNKNOWN_REASON")
-                    print(f"[{self.name}] In-flight payment FAILED: {reason}")
+                    # Notify about cancellation
+                    tx_data = map_transaction(result, tx_type="outgoing")
+                    await self.send_payment_failed_notification(client_pubkey, tx_data)
                     break
                 elif status == "IN_FLIGHT":
                     # Still in flight, just continue waiting
@@ -503,6 +498,7 @@ class NWCBridge:
                     break # Stop tracking once settled
                 
                 elif state in ("CANCELED", "EXPIRED"):
+                    await self.send_invoice_expired_notification(self.client_pk, tx_data)
                     print(f"[{self.name}] Hold invoice {payment_hash[:8]} is {state}. Stopping tracking.")
                     break
                     
@@ -574,11 +570,6 @@ class NWCBridge:
 
         payment_hash = normalize_hash(inv.get("r_hash") or inv.get("payment_hash", ""))
 
-        # # ✅ STORE RECEIVER
-        # PAYMENT_REGISTRY[payment_hash] = {
-        #     "receiver": client_pubkey,
-        #     "payer": None
-        # }
         print(f"[{self.name}] PAYMENT REGISTRY RECEIVER ADDED | hash={payment_hash[:8]}...")
         now = int(time.time())
         result = {
@@ -618,11 +609,9 @@ class NWCBridge:
             # ✅ Start background tracking to wait for final settlement
             logger.info(f"[{self.name}] Hold invoice {payment_hash[:8]} is payment monitoring.")
             asyncio.create_task(self._track_inflight_payment(it, client_pubkey))
-            
-            return None, {
-                "code": "OTHER",
-                "message": "Payment is currently in transition. Once the receiver settles the invoice, we will notify you."
-            }
+            message = "Payment is currently in transition. Once the receiver settles the invoice, we will notify you."
+            await self.send_payment_in_transition_notification(client_pubkey, message)
+            return None, None
 
         if "result" in res:
             res = res["result"]
@@ -715,7 +704,7 @@ class NWCBridge:
         # Use payment_hash if provided, otherwise assume invoice_str is provided
         # (Decoding logic for invoice_str to extract hash may be needed if payment_hash is missing)
         raw = self.node.lookup_invoice(
-            invoice=payment_hash or invoice_str,
+            invoice_str or payment_hash,
         )
 
         if not raw:
@@ -851,7 +840,8 @@ class NWCBridge:
         amount_sat = amount_msat // 1000
         description = params.get("description", "")
         description_hash = params.get("description_hash")
-        expiry = params.get("expiry", 3600)
+        # expiry = params.get("expiry", 3600)
+        expiry = 60
         payment_hash = params.get("payment_hash")
 
         inv = self.node.create_hold_invoice(amount_sat,payment_hash, description, expiry)
@@ -922,7 +912,6 @@ class NWCBridge:
 
     async def handle_request(self, event_dict: dict):
         """Handle incoming NWC requests (Kind 23194)."""
-        # client_pubkey = event_dict.get("pubkey")
         client_pubkey = self.client_pk
         request_id = event_dict.get("id")
 
@@ -979,8 +968,6 @@ class NWCBridge:
             elif method == "list_transactions":
                 result, error = self._handle_list_payments(params)
 
-                # result, error = self._handle_list_transactions(params)
-
             elif method == "list_payments":
                 result, error = self._handle_list_payments(params)
             elif method == "make_hold_invoice":
@@ -994,6 +981,9 @@ class NWCBridge:
                 error = {"code": "NOT_IMPLEMENTED", "message": f"Method '{method}' is not supported"}
 
             # 4. Build spec-compliant response
+            if error is None and result is None:
+                return
+            
             if error:
                 body = make_error_response(method, error["code"], error["message"])
             else:
@@ -1002,7 +992,7 @@ class NWCBridge:
             await self.send_response(client_pubkey, request_id, body)
 
             # 5. Send Notifications
-            if not error:
+            if not error and result:
                 try:
                     if method in ("pay_invoice", "pay_keysend"):
                         payment_hash = result.get("payment_hash")

@@ -239,6 +239,7 @@ class LNDNode:
                 return to_int(str(item.get("creation_time_ns", "0"))[:10]) or to_int(item.get("creation_date"))
 
             combined = []
+            include_incomplete = True
 
             payment_params = {
                 "include_incomplete": str(include_incomplete).lower(),
@@ -289,10 +290,17 @@ class LNDNode:
             for inv in inv_data.get("invoices", []):
                 if inv.get("state") != "SETTLED":
                     continue
+                
+                h = inv.get("r_hash")
+                if h:
+                    try:
+                        h = base64.b64decode(h).hex()
+                    except Exception:
+                        pass
 
                 combined.append({
                     "type": "incoming",
-                    "payment_hash": inv.get("r_hash"),
+                    "payment_hash": h,
                     "value_sat": to_int(inv.get("amt_paid_sat") or inv.get("value")),
                     "fee_sat": 0,
                     "status": inv.get("state"),
@@ -368,7 +376,6 @@ class LNDNode:
                 update = json.loads(line.decode("utf-8"))
                 updates.append(update)
                 
-                # Handle potential "result" wrapping from gRPC-gateway streams
                 inner = update.get("result", update)
                 final_update = inner
 
@@ -395,6 +402,65 @@ class LNDNode:
             logger.error(f"Error looking up invoice: {e}")
             return {"error": str(e)}
 
+    import base64
+
+    def lookup_invoice_v2(
+        self,
+        payment_hash: bytes | str | None = None,
+        payment_addr: bytes | str | None = None,
+        set_id: bytes | str | None = None,
+        lookup_modifier: str = "DEFAULT",
+    ) -> dict:
+        """
+        Look up an invoice via the LookupInvoiceV2 REST API.
+        GET /v2/invoices/lookup
+
+        At least one of payment_hash, payment_addr, or set_id must be provided.
+        Bytes values are accepted and will be base64-encoded automatically.
+
+        Args:
+            payment_hash:     32-byte payment hash (bytes or base64 string).
+            payment_addr:     Payment address/secret (bytes or base64 string).
+            set_id:           AMP set ID (bytes or base64 string).
+            lookup_modifier:  One of "DEFAULT", "HTLC_SET_ONLY", "HTLC_SET_BLANK".
+
+        Returns:
+            dict: Invoice data or {"error": ...} on failure.
+        """
+        if not any([payment_hash, payment_addr, set_id]):
+            return {"error": "At least one of payment_hash, payment_addr, or set_id must be provided."}
+
+        def to_base64(value: bytes | str) -> str:
+            if isinstance(value, bytes):
+                return base64.b64encode(value).decode("utf-8")
+            return value  # assume already base64-encoded string
+
+        params = {}
+        if payment_hash is not None:
+            params["payment_hash"] = to_base64(payment_hash)
+        if payment_addr is not None:
+            params["payment_addr"] = to_base64(payment_addr)
+        if set_id is not None:
+            params["set_id"] = to_base64(set_id)
+        if lookup_modifier != "DEFAULT":
+            params["lookup_modifier"] = lookup_modifier
+
+        try:
+            r = requests.get(
+                f"{self.rest_url}/v2/invoices/lookup",
+                headers=self.headers,
+                params=params,
+                verify=self.cert,
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError as e:
+            logger.error(f"HTTP error looking up invoice v2: {e} — response: {e.response.text}")
+            return {"error": str(e), "details": e.response.text}
+        except Exception as e:
+            logger.error(f"Error looking up invoice v2: {e}")
+            return {"error": str(e)}
+
     def lookup_payment(self, payment_hash):
         try:
             r = requests.get(f"{self.rest_url}/v1/payments/{payment_hash}", headers=self.headers, verify=self.cert)
@@ -410,11 +476,13 @@ class LNDNode:
                 payment_hash = bytes.fromhex(payment_hash)
             
             payment_hash_b64 = base64.b64encode(payment_hash).decode("utf-8")
+            hold_description = f"[HOLD] {description}".strip()
+
             
             payload = {
                 "value": int(amount_sat),
                 "hash": payment_hash_b64,
-                "memo": description,
+                "memo": hold_description,
                 "expiry": int(expiry),
             }
 
