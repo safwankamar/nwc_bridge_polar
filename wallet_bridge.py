@@ -171,7 +171,8 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
     expiry_seconds = int(tx.get("expiry", 3600) or 3600)
     expires_at = created_at + expiry_seconds if created_at else None
 
-    result = {
+    result = tx.copy()
+    result.update({
         "type": tx_type,
         "state": state,
         "status": tx.get("status"),
@@ -185,7 +186,16 @@ def map_transaction(tx: dict, tx_type: str = "incoming") -> dict:
         "created_at": created_at,
         "expires_at": expires_at,
         "settled_at": settle_date if settle_date else None,
-    }
+        "destination": tx.get("destination"),
+        "num_satoshis": tx.get("num_satoshis"),
+        "timestamp": tx.get("timestamp"),
+        "expiry": tx.get("expiry"),
+        "fallback_addr": tx.get("fallback_addr"),
+        "cltv_expiry": tx.get("cltv_expiry"),
+        "route_hints": tx.get("route_hints"),
+        "payment_addr": tx.get("payment_addr"),
+        "num_msat": tx.get("num_msat"),
+    })
     # Remove None optional fields to keep responses clean (but keep required ones)
     return {k: v for k, v in result.items() if v is not None or k in (
         "type", "state", "payment_hash", "amount", "fees_paid", "created_at"
@@ -344,6 +354,10 @@ class NWCBridge:
         """Dedicated helper for invoice_expired."""
         await self.send_notification(client_pubkey, "invoice_expired", tx_data)
 
+    async def send_invoice_cancelled_notification(self, client_pubkey: str, tx_data: dict):
+        """Dedicated helper for invoice_cancelled."""
+        await self.send_notification(client_pubkey, "invoice_cancelled", tx_data)
+
     async def send_payment_in_transition_notification(self, client_pubkey: str, message: str):
         """Dedicated helper for information."""
         await self.send_notification(client_pubkey, "information", {"message": message})
@@ -497,11 +511,15 @@ class NWCBridge:
                     print(f"[{self.name}] Hold invoice {payment_hash[:8]} is SETTLED.")
                     break # Stop tracking once settled
                 
-                elif state in ("CANCELED", "EXPIRED"):
+                elif state == "EXPIRED":
                     await self.send_invoice_expired_notification(self.client_pk, tx_data)
                     print(f"[{self.name}] Hold invoice {payment_hash[:8]} is {state}. Stopping tracking.")
                     break
                     
+                elif state == "CANCELED":
+                    await self.send_invoice_cancelled_notification(self.client_pk, tx_data)
+                    print(f"[{self.name}] Hold invoice {payment_hash[:8]} is {state}. Stopping tracking.")
+                    break
         except Exception as e:
             logger.error(f"[{self.name}] Error tracking hold invoice {payment_hash_hex}: {e}")
 
@@ -561,9 +579,16 @@ class NWCBridge:
 
         amount_sat = amount_msat // 1000
         description = params.get("description", "")
-        expiry = params.get("expiry", 3600)
+        expiry = params.get("expiry")
+        if expiry is None:
+            expiry = 3600
+        else:
+            try:
+                expiry = int(expiry)
+            except (ValueError, TypeError):
+                expiry = 3600
 
-        inv = self.node.create_invoice(amount_sat, description)
+        inv = self.node.create_invoice(amount_sat, description,expiry)
         if not inv or "payment_request" not in inv:
             err_msg = inv.get("message") or inv.get("error", "Failed to create invoice") if inv else "Failed to create invoice"
             return None, {"code": "OTHER", "message": err_msg}
@@ -613,12 +638,15 @@ class NWCBridge:
             await self.send_payment_in_transition_notification(client_pubkey, message)
             return None, None
 
+        error_val = res.get("error")
+        if error_val:
+            # Match the user's requested format: "Payment FAILED! Reason : <error_message>"
+            return None, {"code": "PAYMENT_FAILED", "message": f"Payment FAILED! Reason : {error_val}"}
+
         if "result" in res:
             res = res["result"]
 
-        payment_error = res.get("payment_error") or res.get("error")
-        if payment_error:
-            return None, {"code": "PAYMENT_FAILED", "message": payment_error}
+
 
 
         fee_msat = int(res.get("fee_msat", 0) or 0)
@@ -654,11 +682,32 @@ class NWCBridge:
         )
 
         if not res:
-            return None, {"code": "PAYMENT_FAILED", "message": "Keysend failed: no response from node"}
+            return None, {"code": "PAYMENT_FAILED", "message": "No response from node"}
 
         if not res.get("success"):
-            err_msg = res.get("error") or res.get("error_body", "Unknown error")
-            return None, {"code": "PAYMENT_FAILED", "message": f"Keysend failed: {err_msg}"}
+            error_body = res.get("error") or res.get("error_body", "Unknown error")
+            
+            # If it's a JSON string, try to parse it
+            if isinstance(error_body, str):
+                try:
+                    parsed = json.loads(error_body)
+                    if isinstance(parsed, dict):
+                        error_body = parsed
+                except Exception:
+                    pass
+
+            error_message = error_body
+            if isinstance(error_body, dict):
+                if "message" in error_body:
+                    error_message = error_body["message"]
+                elif "error" in error_body:
+                    inner_error = error_body["error"]
+                    if isinstance(inner_error, dict) and "message" in inner_error:
+                        error_message = inner_error["message"]
+                    else:
+                        error_message = str(inner_error)
+            
+            return None, {"code": "PAYMENT_FAILED", "message": f"Payment FAILED! Reason : {error_message}"}
 
         # The actual payment object is in res["payment"]
         payment = res.get("payment", {})
@@ -669,7 +718,8 @@ class NWCBridge:
         # Check for LND-level failure
         if payment.get("status") == "FAILED":
             reason = payment.get("failure_reason", "Unknown failure")
-            return None, {"code": "PAYMENT_FAILED", "message": f"Payment failed: {reason}"}
+            mapped_reason = self.node.get_mapped_failure_reason(reason)
+            return None, {"code": "PAYMENT_FAILED", "message": f"Payment FAILED! Reason : {mapped_reason}"}
 
         # Normalize res to the payment object for field extraction
         res = payment
@@ -720,67 +770,67 @@ class NWCBridge:
         result = map_transaction(raw, tx_type="incoming")
         return result, None
 
-    def _handle_list_transactions(self, params: dict) -> tuple[dict | None, dict | None]:
-        """
-        list_transactions response:
-        { "transactions": [ <transaction object>, ... ] }
-        Params: from, until, limit, offset, unpaid, type
-        """
-        from_ts = params.get("from", 0)
-        until_ts = params.get("until", int(time.time()))
-        limit = params.get("limit", 20)
-        offset = params.get("offset", 0)
-        include_unpaid = params.get("unpaid", False)
-        tx_type = params.get("type")  # "incoming", "outgoing", or None for both
+    # def _handle_list_transactions(self, params: dict) -> tuple[dict | None, dict | None]:
+    #     """
+    #     list_transactions response:
+    #     { "transactions": [ <transaction object>, ... ] }
+    #     Params: from, until, limit, offset, unpaid, type
+    #     """
+    #     from_ts = params.get("from", 0)
+    #     until_ts = params.get("until", int(time.time()))
+    #     limit = params.get("limit", 20)
+    #     offset = params.get("offset", 0)
+    #     include_unpaid = params.get("unpaid", False)
+    #     tx_type = params.get("type")  # "incoming", "outgoing", or None for both
 
-        transactions = []
+    #     transactions = []
 
-        # Fetch incoming invoices
-        if tx_type in (None, "incoming"):
-            invoices_data = self.node.list_invoices(
-                num_max_invoices=limit,
-                index_offset=offset,
-                reversed=True,
-            )
-            if "error" not in (invoices_data or {}):
-                for inv in (invoices_data or {}).get("invoices", []):
-                    settled = inv.get("settled", False)
-                    creation_date = int(inv.get("creation_date", 0) or 0)
+    #     # Fetch incoming invoices
+    #     if tx_type in (None, "incoming"):
+    #         invoices_data = self.node.list_invoices(
+    #             num_max_invoices=limit,
+    #             index_offset=offset,
+    #             reversed=True,
+    #         )
+    #         if "error" not in (invoices_data or {}):
+    #             for inv in (invoices_data or {}).get("invoices", []):
+    #                 settled = inv.get("settled", False)
+    #                 creation_date = int(inv.get("creation_date", 0) or 0)
 
-                    # Filter by time range
-                    if creation_date < from_ts or creation_date > until_ts:
-                        continue
-                    # Filter unpaid if not requested
-                    if not settled and not include_unpaid:
-                        continue
+    #                 # Filter by time range
+    #                 if creation_date < from_ts or creation_date > until_ts:
+    #                     continue
+    #                 # Filter unpaid if not requested
+    #                 if not settled and not include_unpaid:
+    #                     continue
 
-                    transactions.append(map_transaction(inv, tx_type="incoming"))
+    #                 transactions.append(map_transaction(inv, tx_type="incoming"))
 
-        # Fetch outgoing payments
-        if tx_type in (None, "outgoing"):
-            payments_data = self.node.list_payments(
-                max_payments=limit,
-                index_offset=offset,
-                reversed=True,
-            )
-            if "error" not in (payments_data or {}):
-                for pay in (payments_data or {}).get("payments", []):
-                    creation_time = int(pay.get("creation_time_ns", pay.get("creation_date", 0)) or 0)
-                    if creation_time > 1e12:
-                        creation_time = creation_time // 1_000_000_000
+    #     # Fetch outgoing payments
+    #     if tx_type in (None, "outgoing"):
+    #         payments_data = self.node.list_payments(
+    #             max_payments=limit,
+    #             index_offset=offset,
+    #             reversed=True,
+    #         )
+    #         if "error" not in (payments_data or {}):
+    #             for pay in (payments_data or {}).get("payments", []):
+    #                 creation_time = int(pay.get("creation_time_ns", pay.get("creation_date", 0)) or 0)
+    #                 if creation_time > 1e12:
+    #                     creation_time = creation_time // 1_000_000_000
 
-                    if creation_time < from_ts or creation_time > until_ts:
-                        continue
+    #                 if creation_time < from_ts or creation_time > until_ts:
+    #                     continue
 
-                    transactions.append(map_transaction(pay, tx_type="outgoing"))
+    #                 transactions.append(map_transaction(pay, tx_type="outgoing"))
 
-        # Sort descending by created_at
-        transactions.sort(key=lambda t: t.get("created_at", 0), reverse=True)
+    #     # Sort descending by created_at
+    #     transactions.sort(key=lambda t: t.get("created_at", 0), reverse=True)
 
-        # Apply limit after merge
-        transactions = transactions[:limit]
+    #     # Apply limit after merge
+    #     transactions = transactions[:limit]
 
-        return {"transactions": transactions}, None
+    #     return {"transactions": transactions}, None
 
     def _handle_list_payments(self, params: dict) -> tuple[dict | None, dict | None]:
         """
@@ -806,6 +856,10 @@ class NWCBridge:
         payments = []
         for pay in (payments_data or {}).get("payments", []):
             creation_time = int(pay.get("creation_time_ns", pay.get("creation_date", 0)) or 0)
+            payment_request_str = pay.get("payment_request", "")
+            # if payment_request_str:
+            #     decoded = self.node.decode_pay_req(payment_request_str)
+            
             tx_dir = pay.get("type")
             if creation_time > 1e12:
                 creation_time = creation_time // 1_000_000_000
@@ -817,7 +871,8 @@ class NWCBridge:
             payments.append(map_transaction(pay, tx_type=tx_dir))
 
         # Apply limit
-        payments = payments[:limit]
+        # payments = payments[:offset]
+        # payments = payments
         # payments.reverse()
 
         return {"transactions": payments}, None
@@ -840,8 +895,14 @@ class NWCBridge:
         amount_sat = amount_msat // 1000
         description = params.get("description", "")
         description_hash = params.get("description_hash")
-        # expiry = params.get("expiry", 3600)
-        expiry = 60
+        expiry = params.get("expiry")
+        if expiry is None:
+            expiry = 3600 # Default to 1 hour
+        else:
+            try:
+                expiry = int(expiry)
+            except (ValueError, TypeError):
+                expiry = 3600
         payment_hash = params.get("payment_hash")
 
         inv = self.node.create_hold_invoice(amount_sat,payment_hash, description, expiry)
@@ -968,8 +1029,8 @@ class NWCBridge:
             elif method == "list_transactions":
                 result, error = self._handle_list_payments(params)
 
-            elif method == "list_payments":
-                result, error = self._handle_list_payments(params)
+            # elif method == "list_payments":
+            #     result, error = self._handle_list_payments(params)
             elif method == "make_hold_invoice":
                 result, error = self._handle_make_hold_invoice(params, client_pubkey)
             elif method == "settle_hold_invoice":

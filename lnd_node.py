@@ -7,8 +7,18 @@ import hashlib
 import os
 import httpx
 import asyncio
+import base64
 
 logger = logging.getLogger(__name__)
+
+LND_FAILURE_REASONS = {
+    "FAILURE_REASON_NONE": "No failure",
+    "FAILURE_REASON_TIMEOUT": "Payment attempt timed out",
+    "FAILURE_REASON_NO_ROUTE": "No route to destination",
+    "FAILURE_REASON_ERROR": "Internal LND error",
+    "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS": "Incorrect payment details",
+    "FAILURE_REASON_INSUFFICIENT_BALANCE": "Insufficient balance",
+}
 
 class LNDNode:
     def __init__(self, rest_url, macaroon_path, tls_cert_path, name="LND"):
@@ -24,11 +34,24 @@ class LNDNode:
             logger.error(f"Failed to load macaroon from {macaroon_path}: {e}")
             raise
 
+    def get_mapped_failure_reason(self, reason):
+        return LND_FAILURE_REASONS.get(reason, reason)
+
     def get_info(self):
         try:
             r = requests.get(f"{self.rest_url}/v1/getinfo", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error fetching node info: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error fetching node info: {e}")
             return {"error": str(e)}
@@ -38,16 +61,46 @@ class LNDNode:
             r = requests.get(f"{self.rest_url}/v1/balance/blockchain", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error fetching balance: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
             return {"error": str(e)}
 
-    def create_invoice(self, value_sat, memo="NWC Invoice"):
+    def create_invoice(self, value_sat, memo="NWC Invoice", expiry_seconds=3600):
+        """Create a new invoice with optional expiry."""
         try:
-            data = {"value": str(value_sat), "memo": memo}
-            r = requests.post(f"{self.rest_url}/v1/invoices", headers=self.headers, json=data, verify=self.cert)
+            data = {
+                "value": str(value_sat),
+                "memo": memo,
+                "expiry": expiry_seconds 
+            }
+            r = requests.post(
+                f"{self.rest_url}/v1/invoices", 
+                headers=self.headers, 
+                json=data, 
+                verify=self.cert
+            )
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error creating invoice: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error creating invoice: {e}")
             return {"error": str(e)}  
@@ -76,7 +129,29 @@ class LNDNode:
                     f"{self.rest_url}/v2/router/send",
                     json=data,
                 ) as response:
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        try:
+                            await response.aread()
+                            error_body = response.json()
+                        except Exception:
+                            try:
+                                error_body = response.text
+                            except Exception:
+                                error_body = f"Status {response.status_code}"
+                        
+                        error_message = error_body
+                        if isinstance(error_body, dict):
+                            if "message" in error_body:
+                                error_message = error_body["message"]
+                            elif "error" in error_body:
+                                inner_error = error_body["error"]
+                                if isinstance(inner_error, dict) and "message" in inner_error:
+                                    error_message = inner_error["message"]
+                                else:
+                                    error_message = str(inner_error)
+                        
+                        yield {"success": False, "error": error_message, "raw_error": error_body}
+                        return
 
                     last_status = None
                     last_result = None
@@ -143,9 +218,10 @@ class LNDNode:
 
                             elif status == "FAILED":
                                 reason = result.get("failure_reason", "UNKNOWN_REASON")
+                                mapped_reason = LND_FAILURE_REASONS.get(reason, reason)
                                 yield {
                                     "success": False,
-                                    "error": f"Payment failed: {reason}",
+                                    "error": f"Payment failed: {mapped_reason}",
                                     "result": result,
                                 }
                                 return
@@ -171,18 +247,6 @@ class LNDNode:
                     finally:
                         reader_task.cancel()
 
-        except httpx.HTTPStatusError as e:
-            try:
-                await e.response.aread()
-                error_body = e.response.json()
-            except Exception:
-                try:
-                    error_body = e.response.text
-                except Exception:
-                    error_body = str(e)
-
-            yield {"success": False, "error": error_body}
-
         except Exception as e:
             yield {"success": False, "error": str(e)}
     
@@ -193,6 +257,9 @@ class LNDNode:
             r = requests.get(f"{self.rest_url}/v1/channels", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json().get("channels", [])
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error listing channels: {e}")
+            return []
         except Exception as e:
             logger.error(f"Error listing channels: {e}")
             return []
@@ -202,24 +269,34 @@ class LNDNode:
             r = requests.get(f"{self.rest_url}/v1/balance/channels", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error fetching channel balance: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error fetching channel balance: {e}")
             return {"error": str(e)}
 
-    def list_invoices(self, pending_only=False, index_offset=0, num_max_invoices=0, reversed=False):
-        try:
-            params = {
-                "pending_only": pending_only,
-                "index_offset": index_offset,
-                "num_max_invoices": num_max_invoices,
-                "reversed": reversed,
-            }
-            r = requests.get(f"{self.rest_url}/v1/invoices", headers=self.headers, params=params, verify=self.cert)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.error(f"Error listing invoices: {e}")
-            return {"error": str(e)}
+    # def list_invoices(self, pending_only=False, index_offset=0, num_max_invoices=0, reversed=False):
+    #     try:
+    #         params = {
+    #             "pending_only": pending_only,
+    #             "index_offset": index_offset,
+    #             "num_max_invoices": num_max_invoices,
+    #             "reversed": reversed,
+    #         }
+    #         r = requests.get(f"{self.rest_url}/v1/invoices", headers=self.headers, params=params, verify=self.cert)
+    #         r.raise_for_status()
+    #         return r.json()
+    #     except Exception as e:
+    #         logger.error(f"Error listing invoices: {e}")
+    #         return {"error": str(e)}
 
     def list_payments(self, include_incomplete=False, index_offset=0, max_payments=0, reversed=True):
         try:
@@ -243,7 +320,7 @@ class LNDNode:
 
             payment_params = {
                 "include_incomplete": str(include_incomplete).lower(),
-                "index_offset": index_offset,
+                "index_offset": 0,
                 "max_payments": max_payments,
                 "reversed": str(reversed).lower(),
             }
@@ -258,7 +335,8 @@ class LNDNode:
             pay_data = pay_resp.json()
 
             for p in pay_data.get("payments", []):
-                combined.append({
+                payment_dict = p.copy()
+                payment_dict.update({
                     "type": "outgoing",
                     "payment_hash": p.get("payment_hash"),
                     "value_sat": p.get("value_sat") or p.get("value"),
@@ -270,6 +348,7 @@ class LNDNode:
                     "payment_request": p.get("payment_request"),
                     "raw_data": p,
                 })
+                combined.append(payment_dict)
 
             invoice_params = {
                 "pending_only": "false",
@@ -298,7 +377,8 @@ class LNDNode:
                     except Exception:
                         pass
 
-                combined.append({
+                invoice_dict = inv.copy()
+                invoice_dict.update({
                     "type": "incoming",
                     "payment_hash": h,
                     "value_sat": to_int(inv.get("amt_paid_sat") or inv.get("value")),
@@ -311,16 +391,35 @@ class LNDNode:
                     "memo": inv.get("memo"),
                     "raw_data": inv,
                 })
+                combined.append(invoice_dict)
 
             combined.sort(key=lambda x: x["time_sort"], reverse=True)
+            total_count = len(combined)
+
+            # Apply offset and limit locally
+            # if max_payments is 0, it means fetch all from LND, but we still respect index_offset
+            if max_payments > 0:
+                combined = combined[index_offset:max_payments]
+            else:
+                combined = combined[index_offset:]
 
             return {
                 "payments": combined,
                 "first_index_offset": pay_data.get("first_index_offset", "0"),
                 "last_index_offset": pay_data.get("last_index_offset", "0"),
-                "total_num_payments": str(len(combined)),
+                "total_num_payments": str(total_count),
             }
 
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error listing payments: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error listing payments: {e}")
             return {"error": str(e)}
@@ -398,11 +497,19 @@ class LNDNode:
             r = requests.get(f"{self.rest_url}/v1/payreq/{invoice}", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error looking up invoice: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error looking up invoice: {e}")
             return {"error": str(e)}
-
-    import base64
 
     def lookup_invoice_v2(
         self,
@@ -454,9 +561,16 @@ class LNDNode:
             )
             r.raise_for_status()
             return r.json()
-        except requests.HTTPError as e:
-            logger.error(f"HTTP error looking up invoice v2: {e} — response: {e.response.text}")
-            return {"error": str(e), "details": e.response.text}
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error looking up invoice v2: {e} — response: {e.response.text if e.response else ''}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error looking up invoice v2: {e}")
             return {"error": str(e)}
@@ -466,6 +580,16 @@ class LNDNode:
             r = requests.get(f"{self.rest_url}/v1/payments/{payment_hash}", headers=self.headers, verify=self.cert)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error looking up payment {payment_hash}: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error looking up payment {payment_hash}: {e}")
             return {"error": str(e)}
@@ -494,6 +618,16 @@ class LNDNode:
             )
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error creating hold invoice: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error creating hold invoice: {e}")
             return {"error": str(e)}
@@ -517,6 +651,16 @@ class LNDNode:
             )
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error settling hold invoice: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error settling hold invoice: {e}")
             return {"error": str(e)}
@@ -540,6 +684,16 @@ class LNDNode:
             )
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error canceling hold invoice: {e}")
+            try:
+                if e.response is not None:
+                    error_body = e.response.json()
+                    if "message" in error_body:
+                        return {"error": error_body["message"]}
+            except Exception:
+                pass
+            return {"error": e.response.text if e.response is not None else str(e)}
         except Exception as e:
             logger.error(f"Error canceling hold invoice: {e}")
             return {"error": str(e)}
@@ -588,7 +742,10 @@ class LNDNode:
                     f"{self.rest_url}/v2/router/payments"
                     # params={"no_inflight_updates": False}
                 ) as response:
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        await response.aread()
+                        logger.error(f"[{self.name}] Failed to subscribe to payments: {response.status_code} - {response.text}")
+                        return
 
                     async for raw_line in response.aiter_lines():
                         if not raw_line:
@@ -676,7 +833,10 @@ class LNDNode:
                 headers=self.headers,
             ) as client:
                 async with client.stream("GET", url) as response:
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        await response.aread()
+                        logger.error(f"[{self.name}] Failed to subscribe to invoice {r_hash_hex}: {response.status_code} - {response.text}")
+                        return
 
                     async for raw_line in response.aiter_lines():
                         if not raw_line:
